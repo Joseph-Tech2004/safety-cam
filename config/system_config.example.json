@@ -1,0 +1,165 @@
+{
+  "cameras": [
+    {
+      "source": "0",
+      "name": "Camera 1"
+    }
+  ],
+  "zones": {
+    "0": [
+      {
+        "type": "osc_zone",
+        "name": "Oscilloscope",
+        "points": [
+          [
+            342,
+            162
+          ],
+          [
+            387,
+            165
+          ],
+          [
+            388,
+            214
+          ],
+          [
+            342,
+            210
+          ]
+        ],
+        "active": true
+      },
+      {
+        "type": "toolbox_zone",
+        "name": "Toolbox",
+        "points": [
+          [
+            578,
+            110
+          ],
+          [
+            479,
+            103
+          ],
+          [
+            472,
+            226
+          ],
+          [
+            574,
+            233
+          ]
+        ],
+        "active": true
+      }
+    ],
+    "1": [
+      {
+        "type": "osc_zone",
+        "name": "Oscilloscope",
+        "points": [
+          [
+            341,
+            162
+          ],
+          [
+            416,
+            168
+          ],
+          [
+            415,
+            219
+          ],
+          [
+            339,
+            214
+          ]
+        ],
+        "active": true
+      },
+      {
+        "type": "toolbox_zone",
+        "name": "Toolbox",
+        "points": [
+          [
+            481,
+            230
+          ],
+          [
+            485,
+            111
+          ],
+          [
+            565,
+            112
+          ],
+          [
+            575,
+            234
+          ]
+        ],
+        "active": true
+      },
+      {
+        "type": "ppe_check",
+        "name": "PPE Check",
+        "points": [
+          [
+            -30,
+            7
+          ],
+          [
+            665,
+            5
+          ],
+          [
+            665,
+            500
+          ],
+          [
+            -24,
+            499
+          ]
+        ],
+        "active": true
+      }
+    ],
+    "2": [
+      {
+        "type": "ppe_trigger",
+        "name": "PPE Trigger",
+        "points": [
+          [
+            444,
+            208
+          ],
+          [
+            507,
+            208
+          ],
+          [
+            502,
+            322
+          ],
+          [
+            475,
+            327
+          ],
+          [
+            470,
+            380
+          ],
+          [
+            438,
+            376
+          ]
+        ],
+        "active": true
+      }
+    ]
+  },
+  "schedules": [],
+  "telegram_token": "",
+  "telegram_chat_id": ""
+}

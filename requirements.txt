@@ -1,0 +1,11 @@
+# Runtime
+opencv-python
+numpy
+onnxruntime-directml   # Windows GPU (DirectML); use "onnxruntime" on other systems
+requests
+flask                  # optional: remote web dashboard
+
+# Training / export only
+ultralytics
+pyyaml
+pyinstaller            # building the Windows .exe
