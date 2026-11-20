@@ -1,46 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-SAFETY CAM - camera-based workplace safety monitor
-==================================================
-
-This one file is the whole program (the .exe is built from it with
-PyInstaller - see factory_safety_monitor.spec / build_exe.bat). Helper
-scripts next to it: train_models.py (trains the YOLO models), export_onnx.py
-(converts them to the .onnx files this program runs).
-
-HOW IT WORKS (one frame of one camera)
-  1. Read the camera (webcam / IP / RTSP on its own thread, or a video file).
-  2. Resize to a fixed analysis size (PROC_W x PROC_H).
-  3. PersonDetector (own thread) finds people with yolov8n.
-  4. process_cam_frame(): tracks each person, checks which zones they are in
-     and asks the PPE worker (own thread) to run the detector models on a
-     crop of that person - helmet, vest, goggles, gloves, shoes, harness,
-     lab coat, smoking - whatever that zone was set to check.
-  5. Violations -> on-screen label, Admin Log, Telegram photo, daily alerts
-     folder; RoomWatch checks lights / people after shift hours.
-  6. The annotated frame is recorded (DVR) and the tile is drawn in the grid.
-
-SECTIONS (search for the "# ── NAME" headers)
-  CONFIG ........................ paths, model file names, timing constants
-  CRISP GLYPH ICONS / UI TEXT ... Windows icon font + Segoe UI text for the UI
-  TELEGRAM ...................... alert messages and photos (background threads)
-  CHECK ITEMS + MODELS .......... what can be checked; model class -> item map
-  MODEL RUNNER (ONNX Runtime) ... OnnxYOLO: runs the models on GPU (DirectML) or CPU
-  ZONE TYPES / ZONE EDITOR ...... inspection / trigger / rest-area zones, drawing,
-                                  editing, turning zones off for N hours
-  SAFETY CHECK .................. check_items(): the model "vote" for one person
-  PPE WORKER .................... runs those checks off the video thread
-  TRACKING / ADMIN LOG .......... person IDs between frames; the event log
-  TOP BAR / REVIEW BAR / PANELS . everything drawn around the cameras
-  SHIFT & AFTER-HOURS ROOM WATCH  lights / people alerts outside shift hours
-  PROCESS FRAME ................. PersonDetector + process_cam_frame()
-  SETUP GUI ..................... the first window (cameras, Telegram, remote)
-  REMOTE ACCESS / WEB EVENTS .... web dashboard + Cloudflare link
-  DAILY ALERTS .................. alert photos saved per day (Admin Log tab)
-  RECORDING (DVR) ............... continuous recording, playback, clean-up
-  MAIN MONITOR .................. run_monitor(): the main loop, mouse, keys
-  ENTRY ......................... program start
-"""
 import cv2
 import numpy as np
 import threading
@@ -52,8 +9,6 @@ import requests
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
 
-# Remote access (local web dashboard + Cloudflare Tunnel) is optional — the
-# core safety-monitoring app must keep working even if Flask isn't installed.
 try:
     from flask import Flask, request, session, redirect, url_for, Response, render_template_string
     from werkzeug.security import generate_password_hash, check_password_hash
@@ -62,7 +17,6 @@ except ImportError:
     FLASK_AVAILABLE = False
     generate_password_hash = check_password_hash = None
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
 CONFIG_FILE   = "system_config.json"
 LOG_PATH      = "logs"
 os.makedirs(LOG_PATH, exist_ok=True)
@@ -74,12 +28,6 @@ else:
 
 PERSON_MODEL_PATH   = os.path.join(BASE_DIR, "yolov8n.onnx")
 ICON_PATH           = os.path.join(BASE_DIR, "icon.ico")
-# Every detector found here is loaded; what each one can check (helmet,
-# goggles, smoking...) is worked out from its own class names via
-# CLASS_ITEM_MAP, so a newly trained model only needs its file name added.
-# The models are trained with ultralytics (train_models.py -> .pt) and
-# exported to ONNX (export_onnx.py) - the app itself runs them with ONNX
-# Runtime, so it needs neither PyTorch nor an NVIDIA card (see OnnxYOLO).
 DETECTOR_MODEL_FILES = ["best_ppe.onnx", "best_ppe_v2.onnx", "best_ppe_plus.onnx", "best_smoking.onnx",
                         "best_helmet.onnx", "best_labcoat.onnx", "best_gloves.onnx"]
 
@@ -90,9 +38,6 @@ PPE_INTERVAL        = 1.0
 TELEGRAM_PPE_DELAY  = 5
 
 THEME = {
-    # Neutral charcoal + material-blue accent — matches the NVR-style
-    # reference the user provided, instead of the earlier warm brown/amber
-    # industrial palette.
     "bg_panel":      (20, 18, 18),
     "bg_panel_alt":  (30, 26, 26),
     "bg_header":     (34, 30, 30),
@@ -174,12 +119,6 @@ def icon_edit(img, cx, cy, s, color, thickness=1):
     cv2.line(img, p1, p2, color, thickness+1)
     cv2.circle(img, p2, 2, color, -1)
 
-# ── CRISP GLYPH ICONS (top bar) ────────────────────────────────────────────────
-# Windows ships a real icon font (Segoe Fluent Icons / SegoeIcons.ttf) with
-# clean, professional glyphs — used instead of hand-drawn cv2 shapes for the
-# top bar, so those specific icons look like real pictures, not primitives.
-# No download, no license to track: it's a stock OS font. Codepoints below
-# were confirmed by rendering a full glyph sheet and visually matching them.
 try:
     from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFont as _PILFont
     _ICON_FONT_PATH = r"C:\Windows\Fonts\SegoeIcons.ttf"
@@ -188,42 +127,37 @@ except ImportError:
     GLYPH_ICONS_AVAILABLE = False
 
 GLYPH_CODES = {
-    "log":    0xE7C3,  # page outline — Admin Log
-    "select": 0xE9D5,  # checklist — Select Inspection Type
-    "tools":  0xE90F,  # wrench — Tools Summary
-    "edit":   0xE70F,  # pencil — Edit Mode
-    "help":   0xE9CE,  # circled question mark — Help
-    "pause":  0xE769,  # Pause
-    "play":   0xE768,  # Play / Resume
-    "camera": 0xE722,  # Camera — snapshot
-    "stop":    0xE8A8,  # solid filled square — Stop (review bar; E76A looked right at
-                         # large size but turned out to be a hollow outline, illegible
-                         # at icon size - re-verified by rendering both at actual size)
-    "rewind":  0xE892,  # skip-back — Rewind (review bar)
-    "forward": 0xE893,  # skip-ahead — Forward (review bar)
-    "shift":   0xE823,  # clock — Shift & Room Watch
-    "bulb":    0xE82F,  # lightbulb — room lights (tile badge)
-    "people":  0xE716,  # people — room occupancy (tile badge)
-    "back":    0xE72B,  # left arrow — back to the setup screen
-    "grid":    0xE80A,  # grid — leave the enlarged-camera view
-    "video":   0xE714,  # video camera — tile header
-    "shield":  0xEA18,  # shield — inspection zone / app badge
-    "power":   0xE7E8,  # power — pause / resume ALL zones
-    "flag":    0xE7C1,  # flag — trigger zone
-    "cup":     0xEC32,  # cup — rest area
-    "warning": 0xE7BA,  # warning triangle
-    "expand":  0xE740,  # expand — enlarge the selected camera
-    "back10":  0xED3C,  # circular arrow with "10" — back 10 s
-    "fwd10":   0xED3C,  # same glyph with the arrow mirrored (see get_glyph_icon) — forward 10 s
-    "frew":    0xEB9E,  # fast rewind
-    "ffwd":    0xEB9D,  # fast forward
+    "log":    0xE7C3,
+    "select": 0xE9D5,
+    "tools":  0xE90F,
+    "edit":   0xE70F,
+    "help":   0xE9CE,
+    "pause":  0xE769,
+    "play":   0xE768,
+    "camera": 0xE722,
+    "stop":    0xE8A8,
+    "rewind":  0xE892,
+    "forward": 0xE893,
+    "shift":   0xE823,
+    "bulb":    0xE82F,
+    "people":  0xE716,
+    "back":    0xE72B,
+    "grid":    0xE80A,
+    "video":   0xE714,
+    "shield":  0xEA18,
+    "power":   0xE7E8,
+    "flag":    0xE7C1,
+    "cup":     0xEC32,
+    "warning": 0xE7BA,
+    "expand":  0xE740,
+    "back10":  0xED3C,
+    "fwd10":   0xED3C,
+    "frew":    0xEB9E,
+    "ffwd":    0xEB9D,
 }
 _glyph_cache = {}
 
 def get_glyph_icon(name, size, color_bgr):
-    """Renders (and caches) one glyph as a BGRA numpy array. Rendered once
-    per (name, size, color) the first time it's needed, not every frame —
-    PIL text rendering isn't free, and the top bar redraws every loop tick."""
     key = (name, size, color_bgr)
     cached = _glyph_cache.get(key)
     if cached is not None: return cached
@@ -238,11 +172,9 @@ def get_glyph_icon(name, size, color_bgr):
         r, g, b = color_bgr[2], color_bgr[1], color_bgr[0]
         d.text((size/2 - tw/2 - bbox[0], size/2 - th/2 - bbox[1]), ch,
                font=font, fill=(r, g, b, 255))
-        arr = np.array(img)  # RGBA
+        arr = np.array(img)
         bgra = arr[:, :, [2, 1, 0, 3]].copy()
         if name == "fwd10":
-            # The icon font only has "forward 30"; mirror the arc of
-            # "back 10" (top ~42%) and keep its "10" digits as they are.
             split = int(size * 0.42)
             bgra[:split] = bgra[:split, ::-1].copy()
         _glyph_cache[key] = bgra
@@ -252,9 +184,6 @@ def get_glyph_icon(name, size, color_bgr):
         return None
 
 def draw_glyph_icon(frame, name, cx, cy, size, color_bgr):
-    """Alpha-composites a cached glyph icon centered at (cx, cy). Falls back
-    to a plain circle if the icon font isn't available on this machine, so a
-    missing font file never breaks the UI, just makes it a bit plainer."""
     icon = get_glyph_icon(name, size, color_bgr)
     if icon is None:
         cv2.circle(frame, (cx, cy), size//3, color_bgr, 2)
@@ -273,13 +202,6 @@ def _blit_bgra(frame, patch, x1, y1):
     alpha = src[:, :, 3:4].astype(np.float32) / 255.0
     roi[:] = (roi.astype(np.float32) * (1-alpha) + src[:, :, :3].astype(np.float32) * alpha).astype(np.uint8)
 
-# ── CRISP UI TEXT ─────────────────────────────────────────────────────────────
-# OpenCV's built-in Hershey font is thin and jagged; all UI text is drawn
-# with Segoe UI instead. put_text/text_size take the same arguments as
-# cv2.putText/cv2.getTextSize (font scale is mapped to a pixel size with
-# about the same cap height), so layout code didn't have to change. Each
-# (text, size, colour) is rendered once and cached - the UI redraws every
-# frame. Falls back to OpenCV's font if PIL/Segoe UI aren't there.
 _UI_FONT_FILES = {False: r"C:\Windows\Fonts\segoeui.ttf", True: r"C:\Windows\Fonts\seguisb.ttf"}
 UI_FONT_AVAILABLE = GLYPH_ICONS_AVAILABLE and all(os.path.exists(f) for f in _UI_FONT_FILES.values())
 UI_PX_PER_SCALE = 32
@@ -320,9 +242,6 @@ def put_text(img, text, org, font=cv2.FONT_HERSHEY_SIMPLEX, scale=0.4, color=(25
     patch, ox, oy = hit
     _blit_bgra(img, patch, int(org[0]) + ox, int(org[1]) + oy)
 
-# The hand-drawn zone/camera icons are replaced by the same Segoe icon font
-# the top bar uses (same signature, so callers don't change); the old
-# line-drawn versions stay as the fallback when the font is missing.
 def _glyph_or(name, fallback, scale=2.3):
     def draw(img, cx, cy, s, color, thickness=1):
         if GLYPH_ICONS_AVAILABLE: draw_glyph_icon(img, name, int(cx), int(cy), max(12, int(s * scale)), color)
@@ -335,7 +254,6 @@ icon_alert  = _glyph_or("warning", icon_alert)
 icon_rest   = _glyph_or("cup", icon_rest)
 icon_edit   = _glyph_or("edit", icon_edit, scale=2.6)
 
-# ── TELEGRAM ──────────────────────────────────────────────────────────────────
 last_telegram_time = {}
 _telegram_lock = threading.Lock()
 
@@ -345,10 +263,6 @@ def _send_text_worker(token, chat_id, msg):
             f"https://api.telegram.org/bot{token}/sendMessage",
             data={"chat_id": chat_id, "text": msg},
             timeout=10)
-        # requests.post() only raises on connection-level failures (DNS,
-        # timeout) - an HTTP 200 with {"ok": false} (wrong chat_id, bot not
-        # in the chat, etc.) was silently treated as success before this
-        # check existed, printing "SENT" even when Telegram rejected it.
         data = r.json()
         if data.get("ok"):
             print(f"[TELEGRAM SENT] {msg}")
@@ -385,7 +299,6 @@ def send_telegram(msg, cooldown=60):
         key = msg[:30]; now = time.time()
         if now - last_telegram_time.get(key, 0) < cooldown: return
         last_telegram_time[key] = now
-    # Fire and forget — does NOT block main thread
     t = threading.Thread(
         target=_send_text_worker,
         args=(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg),
@@ -407,7 +320,6 @@ def send_telegram_photo(msg, image, cooldown=60):
         print(f"[TELEGRAM PHOTO ENCODE ERROR] {e}"); return
     if not ok: return
     img_bytes = img_encoded.tobytes()
-    # Fire and forget — does NOT block main thread
     t = threading.Thread(
         target=_send_photo_worker,
         args=(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg, img_bytes),
@@ -415,13 +327,6 @@ def send_telegram_photo(msg, image, cooldown=60):
     t.start()
 
 def validate_telegram_config(token, chat_id, timeout=8):
-    """Checks the bot token AND chat/group id against Telegram's real API
-    before monitoring starts, so a typo (or a chat id that went stale after
-    the group turned into a supergroup) shows up immediately as a clear
-    message instead of silently failing on the first real violation, hours
-    later. Returns (ok, message) - message is empty on success. Not
-    configured at all (both blank) is treated as "nothing to check", not
-    an error - Telegram alerts are optional."""
     if not token or not chat_id:
         return True, ""
     try:
@@ -443,21 +348,12 @@ def validate_telegram_config(token, chat_id, timeout=8):
     return True, ""
 
 def _telegram_check_worker(token, chat_id):
-    """Runs on a background thread once the monitor window is already up
-    and cameras are opening - the check used to block Setup's Launch button
-    for several seconds before the monitor window even appeared, which felt
-    like the app hanging. Now the window opens immediately and this just
-    reports into the Admin Log whenever it finishes, same pattern as the
-    remote-tunnel connect message."""
     ok, err = validate_telegram_config(token, chat_id)
     if ok:
         add_log("Telegram bot connected and verified", THEME["ok"])
     else:
         add_log(f"Telegram not connected: {err}", THEME["danger"])
 
-# ── CHECK ITEMS + MODELS ──────────────────────────────────────────────────────
-# What a zone can be told to check for. "ppe" items are violations when NOT
-# seen on the person; "behavior" items are violations when they ARE seen.
 CHECK_ITEMS = {
     "helmet":  {"label": "Helmet",  "kind": "ppe"},
     "vest":    {"label": "Vest",    "kind": "ppe"},
@@ -469,24 +365,13 @@ CHECK_ITEMS = {
     "smoking": {"label": "Smoking", "kind": "behavior"},
 }
 DEFAULT_CHECKS = ["helmet", "vest"]
-# Items that sit low on the body (or cover most of it) - the person crop must
-# include the whole body, not just head/torso, when any of these are checked.
 FULL_BODY_ITEMS = {"gloves", "shoes", "harness", "labcoat"}
 PPE_CONF     = 0.35
-# Smoking: measured on the user's lab videos (nobody smoking) the model's
-# false hits topped out at 0.69 and mostly sat at 0.42-0.62 ("smoker" firing
-# on faces); 0.60 removes most of them. A cigarette is small and drops in
-# and out of view, so instead of demanding it on every 1s check (one miss
-# would reset the alert timer), a person counts as smoking while it was seen
-# in at least BEHAVIOR_MIN_HITS of their last BEHAVIOR_WINDOW checks.
 SMOKING_CONF      = 0.60
 BEHAVIOR_WINDOW   = 5
 BEHAVIOR_MIN_HITS = 2
-BEHAVIOR_RECHECK  = 0.3     # s between checks while one smoking sighting awaits confirmation
+BEHAVIOR_RECHECK  = 0.3
 
-# Different datasets name the same thing differently ("Hardhat" vs "Helmet",
-# "NO-Safety-Vest" vs "No_Vest"). Names are normalised (lowercase, '-'/' ' ->
-# '_') and mapped to (item, positive). positive=False means "seen WITHOUT it".
 CLASS_ITEM_MAP = {
     "hardhat": ("helmet", True), "helmet": ("helmet", True), "head_with_helmet": ("helmet", True),
     "no_hardhat": ("helmet", False), "no_helmet": ("helmet", False),
@@ -508,18 +393,10 @@ CLASS_ITEM_MAP = {
     "smoker": ("smoking", True), "vape": ("smoking", True),
 }
 
-# Class names whose meaning depends on the dataset: in the Hard Hat Workers
-# helmet dataset "head" is a head WITHOUT a helmet, while other datasets use
-# "head" for any head - so it can't go in the global map.
 MODEL_CLASS_OVERRIDES = {
     "best_helmet.onnx": {"head": ("helmet", False)},
 }
 
-# Models trusted for only some of the items they detect. best_gloves is our
-# own model, trained on ~10k images merged from 6 datasets (merge_datasets.py:
-# white work gloves, blue/teal nitrile, lab and welding gloves, bare hands).
-# On hand-labelled people from our workshop videos it caught 6 of 7 gloved
-# hands (the earlier models: 2 of 7) with no false "gloves" on 107 bare hands.
 MODEL_ITEM_ALLOW = {
     "best_gloves.onnx": {"gloves"},
 }
@@ -527,28 +404,16 @@ MODEL_ITEM_ALLOW = {
 def _norm_class(name):
     return str(name).strip().lower().replace("-", "_").replace(" ", "_")
 
-detector_models = []   # [{"file", "model", "class_map": {cls_idx: (item, positive)}, "items": set}]
+detector_models = []
 
 def supported_items():
     s = set()
     for m in detector_models: s |= m["items"]
     return s
 
-# ── MODEL RUNNER (ONNX Runtime) ───────────────────────────────────────────────
-# Runs a YOLOv8 model exported to ONNX. Gives exactly the same boxes and
-# confidences as ultralytics (checked on all 8 models: 100% of boxes match,
-# same scores) because it prepares the image the same way - resize to the
-# model's training size, pad to a multiple of 32 with grey (114), RGB 0..1 -
-# and decodes the output the same way (best class per anchor, then
-# per-class non-max suppression at IoU 0.7).
-# DirectML lets ONNX Runtime use ANY DirectX 12 graphics card - NVIDIA, AMD
-# or a laptop's built-in Intel GPU - and it falls back to the CPU if there
-# is none. That's what lets the program run on a weaker laptop, and dropping
-# PyTorch shrank the installed program from 4.4 GB to well under 1 GB.
-_dml_lock = threading.Lock()     # DirectML: one inference at a time on the GPU
+_dml_lock = threading.Lock()
 
 class _Det:
-    """One detection, shaped like an ultralytics box: .xyxy[0], .conf[0], .cls[0]."""
     __slots__ = ("xyxy", "conf", "cls")
     def __init__(self, xyxy, conf, cls):
         self.xyxy = (xyxy,); self.conf = (conf,); self.cls = (cls,)
@@ -561,45 +426,41 @@ class OnnxYOLO:
     def __init__(self, path):
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # Several models run side by side (person thread + PPE thread): by
-        # default each keeps all its CPU threads busy-waiting between runs,
-        # starving the others - measured 50 ms -> 550 ms per model. Fewer
-        # threads that sleep when idle keep every model at full speed.
         so.add_session_config_entry("session.intra_op.allow_spinning", "0")
         so.add_session_config_entry("session.set_denormal_as_zero", "1")
         so.intra_op_num_threads = max(1, min(4, (os.cpu_count() or 4) // 2))
         providers = [p for p in ("DmlExecutionProvider", "CPUExecutionProvider")
                      if p in ort.get_available_providers()]
-        if os.environ.get("SAFETYCAM_CPU") == "1":      # force CPU (testing / a GPU driver problem)
+        if os.environ.get("SAFETYCAM_CPU") == "1":
             providers = ["CPUExecutionProvider"]
         if "DmlExecutionProvider" in providers:
-            so.enable_mem_pattern = False                         # required by DirectML
+            so.enable_mem_pattern = False
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         try:
             self.sess = ort.InferenceSession(path, so, providers=providers)
-        except Exception:                                         # no usable GPU: CPU
+        except Exception:
             self.sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
         self.on_gpu = self.sess.get_providers()[0] == "DmlExecutionProvider"
         self.inp = self.sess.get_inputs()[0].name
-        meta = self.sess.get_modelmeta().custom_metadata_map    # written by the ultralytics export
+        meta = self.sess.get_modelmeta().custom_metadata_map
         self.names = {int(k): v for k, v in ast.literal_eval(meta.get("names", "{}")).items()}
-        self.size = int(ast.literal_eval(meta.get("imgsz", "[640, 640]"))[0])   # its training size
+        self.size = int(ast.literal_eval(meta.get("imgsz", "[640, 640]"))[0])
 
     def __call__(self, img, conf=0.25, iou=0.7, verbose=False, max_det=300):
         h, w = img.shape[:2]; S = self.size
         r = min(S / h, S / w)
         nw, nh = int(round(w * r)), int(round(h * r))
         im = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR) if (nw, nh) != (w, h) else img
-        dw, dh = ((S - nw) % 32) / 2, ((S - nh) % 32) / 2      # pad to a multiple of 32
+        dw, dh = ((S - nw) % 32) / 2, ((S - nh) % 32) / 2
         top, left = int(round(dh - 0.1)), int(round(dw - 0.1))
         im = cv2.copyMakeBorder(im, top, int(round(dh + 0.1)), left, int(round(dw + 0.1)),
                                 cv2.BORDER_CONSTANT, value=(114, 114, 114))
-        blob = cv2.dnn.blobFromImage(im, 1 / 255.0, swapRB=True)          # 1x3xHxW, RGB, 0..1
+        blob = cv2.dnn.blobFromImage(im, 1 / 255.0, swapRB=True)
         if self.on_gpu:
             with _dml_lock: out = self.sess.run(None, {self.inp: blob})[0][0]
         else:
             out = self.sess.run(None, {self.inp: blob})[0][0]
-        out = out.T                                    # one row per anchor: cx, cy, w, h, class scores...
+        out = out.T
         scores = out[:, 4:]
         cls = scores.argmax(1); cf = scores[np.arange(len(cls)), cls]
         keep = cf > conf
@@ -610,7 +471,7 @@ class OnnxYOLO:
         dets = []
         for i in idx[:max_det]:
             x1, y1, bw, bh = xywh[i]
-            x1 = (x1 - left) / r; y1 = (y1 - top) / r          # back to the original image's pixels
+            x1 = (x1 - left) / r; y1 = (y1 - top) / r
             dets.append(_Det(np.array([max(0, x1), max(0, y1), min(w, x1 + bw / r), min(h, y1 + bh / r)],
                                       np.float32), float(cf[i]), float(cls[i])))
         return [_Result(dets)]
@@ -644,16 +505,6 @@ def load_models():
     if not detector_models:
         add_log("No PPE/safety detector models found", THEME["warn"])
 
-    # A freshly loaded model's FIRST real inference call pays a one-time cost
-    # (CUDA kernel JIT compilation on GPU, thread-pool/oneDNN setup on CPU)
-    # that has nothing to do with frame size or camera speed - measured at
-    # ~2.5s for the first call and ~0.9s for the next model's first call.
-    # Left alone, that cost silently lands on whichever real video frames
-    # happen to trigger each model first, which is exactly the choppy/
-    # stuttering start the user was seeing. Paying it here instead, on a
-    # throwaway blank frame while the user is still on the Setup screen,
-    # means every real frame in run_monitor() runs at steady-state speed
-    # from frame 1.
     dummy = np.zeros((640, 640, 3), dtype=np.uint8)
     for m in [person_mdl] + [d["model"] for d in detector_models]:
         try: m(dummy, verbose=False)
@@ -662,13 +513,6 @@ def load_models():
     return person_mdl
 
 def set_opencv_window_icon(window_title, icon_path):
-    """Sets the taskbar/titlebar icon for an OpenCV HighGUI window.
-    OpenCV has no built-in API for this - this is a Windows-only
-    workaround via ctypes + Win32 API. Must be called AFTER the window
-    has actually been shown at least once (e.g. after the first
-    cv2.imshow), otherwise FindWindowW may not locate it yet. Silently
-    does nothing on non-Windows platforms or if anything goes wrong,
-    since a missing icon should never crash the program."""
     if sys.platform != "win32":
         return False
     if not os.path.exists(icon_path):
@@ -695,25 +539,14 @@ def set_opencv_window_icon(window_title, icon_path):
     except Exception:
         return False
 
-# ── ZONE TYPES ────────────────────────────────────────────────────────────────
-# "ppe_check" = inspect while the person is inside the zone. "ppe_trigger" =
-# a doorway-style zone: passing through it arms its checks for that person
-# until they pass them. Both carry their own "checks" list (any CHECK_ITEMS).
 ZONE_TYPES = {
     "ppe_check":    {"label": "Inspection", "color": (80, 220, 220), "icon": icon_helmet, "has_checks": True},
     "ppe_trigger":  {"label": "Trigger",    "color": (60, 150, 255), "icon": icon_alert,  "has_checks": True},
     "rest_area":    {"label": "Rest Area",  "color": (110, 210, 110),"icon": icon_rest,   "has_checks": False},
 }
 
-# A zone can be switched off without deleting it: zone["off"] is None (on),
-# "manual" (off until someone turns it back on) or a timestamp (off until
-# then - e.g. 2 h for a breakdown or an event in that area).
 ZONE_OFF_HOURS = [1, 2, 3, 4, 5]
 
-# One switch for ALL zones (top bar power button), stored as config
-# "zones_paused" - None, "manual" or a timestamp, like one zone's "off".
-# It sits on top of each zone's own setting instead of overwriting it, so
-# turning everything back on restores exactly what was on before.
 ZONES_PAUSE = {"off": None}
 
 def zones_paused(now=None):
@@ -783,12 +616,6 @@ def load_config():
         except: pass
     return default_config()
 
-# ── ZONE EDITOR ───────────────────────────────────────────────────────────────
-# Zones are always stored in this fixed virtual coordinate space, regardless
-# of what resolution the window/camera tiles are actually rendered at right
-# now. Storage never changes when the window is resized — only the on-screen
-# scale factor used to draw/hit-test them does. This is what lets the window
-# be freely resizable while zones stay correctly aligned with the video.
 ZONE_BASE_W = 640
 ZONE_BASE_H = 480
 
@@ -801,10 +628,6 @@ class ZoneEditor:
         self.DRAG_R         = 10
 
     def load(self, cfg):
-        """Also migrates older configs: oscilloscope/toolbox zones are
-        dropped (that inspection no longer exists), and PPE zones saved
-        before per-zone checks existed keep their old behaviour (helmet +
-        vest) instead of silently checking nothing."""
         self.zones = {}
         for k, v in cfg.get("zones", {}).items():
             kept = []
@@ -848,7 +671,6 @@ class ZoneEditor:
         else: zone["off"] = value
 
     def expire_offs(self, now):
-        """Zones whose 'off for N hours' ran out - switched back on."""
         back = []
         for ci, zs in self.zones.items():
             for z in zs:
@@ -862,8 +684,6 @@ class ZoneEditor:
             self.zones[ci].pop(zi)
 
     def scaled_points(self, zone, pw=ZONE_BASE_W, ph=ZONE_BASE_H):
-        """Zone points converted from the fixed storage space to whatever
-        pixel size (pw, ph) is actually being rendered/detected on right now."""
         sx, sy = pw/ZONE_BASE_W, ph/ZONE_BASE_H
         return np.array([[int(p[0]*sx), int(p[1]*sy)] for p in zone["points"]], dtype=np.int32)
 
@@ -894,9 +714,6 @@ class ZoneEditor:
 
     def draw_zones(self, frame, ci, edit_mode=False, pw=ZONE_BASE_W, ph=ZONE_BASE_H):
         zones = self.get_zones(ci)
-        # One frame-copy + one blend for ALL zone fills instead of one pair
-        # per zone (used to be O(zone_count) full-frame copies every frame,
-        # per camera) — same visual result, cheaper with several zones.
         fillable = [z for z in zones if len(z["points"]) >= 3 and zone_on(z)]
         if fillable:
             ov = frame.copy()
@@ -962,9 +779,6 @@ class ZoneEditor:
         self.selected_index = None
 
     def handle_mouse(self, event, x, y, ci, pw=ZONE_BASE_W, ph=ZONE_BASE_H):
-        # (x, y) arrive in real on-screen pixels for whatever size the tile
-        # is rendered at right now — convert once here so everything below
-        # keeps comparing/storing in the fixed virtual space, unchanged.
         x, y = int(x*ZONE_BASE_W/pw), int(y*ZONE_BASE_H/ph)
         zones = self.get_zones(ci)
         DR    = self.DRAG_R
@@ -996,13 +810,7 @@ class ZoneEditor:
                     if abs(p[0]-x) < DR and abs(p[1]-y) < DR and len(zone["points"]) > 3:
                         zone["points"].pop(pi); return
 
-# ── SAFETY CHECK ──────────────────────────────────────────────────────────────
 def check_items(frame, x1, y1, x2, y2, items):
-    """Runs only the detector models that can check at least one of the
-    requested items, on a crop of this person, and returns {item: ok} for
-    every requested item some loaded model supports. Items no model supports
-    are left out entirely - they must never count as a violation just
-    because nothing was able to look for them."""
     items = set(items)
     models = [m for m in detector_models if m["items"] & items]
     if not models: return {}
@@ -1012,8 +820,6 @@ def check_items(frame, x1, y1, x2, y2, items):
     pad_side = max(25, int((x2-x1) * 0.15))
     ex1 = max(0, x1-pad_side); ex2 = min(W, x2+pad_side)
     ey1 = max(0, y1-pad_top)
-    # Head/torso is enough (and sharper) for helmet/vest/goggles/smoking;
-    # shoes, gloves and harness need the rest of the body in the crop.
     ey2 = min(H, y2 + int(ph*0.05)) if items & FULL_BODY_ITEMS else min(H, y1 + int(ph * 0.65))
     crop = frame[ey1:ey2, ex1:ex2]
 
@@ -1042,12 +848,6 @@ def check_items(frame, x1, y1, x2, y2, items):
             result[item] = pos[item] >= PPE_CONF and pos[item] >= neg[item]
     return result
 
-# ── PPE WORKER ────────────────────────────────────────────────────────────────
-# A check runs every detector that covers the zone's items on a person crop
-# (up to ~4 models) - done inline it froze the video for 50-200 ms each
-# time. Jobs go to one background thread instead; process_cam_frame picks
-# the result up from the track on a later frame. One job per person at a
-# time, and the analysis frame is never drawn on, so it can be shared.
 _ppe_queue = queue.Queue()
 _ppe_worker_started = [False]
 
@@ -1068,11 +868,9 @@ def submit_ppe_check(t, frame, box, items):
     _ppe_queue.put((t, frame, box, set(items)))
 
 def violation_short(items):
-    """'HELMET & SMOKING' - for on-video labels and the admin log."""
     return " & ".join(CHECK_ITEMS[i]["label"].upper() for i in ordered_checks(items))
 
 def violation_message(items):
-    """(title, detail lines) for Telegram / the web dashboard."""
     items = ordered_checks(items)
     ppe = [CHECK_ITEMS[i]["label"].upper() for i in items if CHECK_ITEMS[i]["kind"] == "ppe"]
     smoking = "smoking" in items
@@ -1083,15 +881,11 @@ def violation_message(items):
     if smoking: lines.append("Smoking detected")
     return title, lines
 
-# ── TRACKING ──────────────────────────────────────────────────────────────────
 cam_tracked = defaultdict(dict)
 cam_nid     = defaultdict(lambda: [0])
 
-# Every camera is analysed at one fixed size, whatever size its tile is
-# shown at - so resizing the window or enlarging a camera never changes
-# detection, tracking or zone hit-testing (zones scale with the frame).
 PROC_W, PROC_H = 960, 720
-TRACK_MATCH_PX = 120          # max centre jump (in PROC pixels) to stay the same person
+TRACK_MATCH_PX = 120
 
 def get_track(ci, cx, cy):
     for tid, d in cam_tracked[ci].items():
@@ -1108,10 +902,9 @@ def get_track(ci, cx, cy):
         "rest_entry_start": None, "rest_notified": False}
     return tid
 
-# ── ADMIN LOG — full scrollable history ───────────────────────────────────────
 admin_log      = []
 log_scroll_pos = [0]
-ADMIN_LOG_MAX  = 5000  # caps memory growth on a long-running demo/session
+ADMIN_LOG_MAX  = 5000
 
 def add_log(text, color=None):
     if color is None: color = THEME["text_primary"]
@@ -1130,7 +923,6 @@ def log_file(event, detail=""):
     except Exception as e:
         print(f"[LOG FILE ERROR] {e}")
 
-# ── HELP CONTENT ──────────────────────────────────────────────────────────────
 HELP_CONTENT = [
     ("TOP BAR ICONS", "", ""),
     ("", "Back",    "Return to the setup screen"),
@@ -1182,17 +974,15 @@ HELP_CONTENT = [
     ("", "Exit Program", "Close the monitor"),
 ]
 
-# ── TOP BAR + DOCKED SIDEBAR ────────────────────────────────────────────────────
 APP_NAME       = "SAFETY CAM"
-TOP_BAR_H      = 40           # fixed regardless of camera count/window size
-PANEL_W        = 240          # fixed docked sidebar width — does not shrink the camera grid
+TOP_BAR_H      = 40
+PANEL_W        = 240
 PANEL_HEADER_H = 36
 ICON_BTN       = 28
 ICON_GAP       = 6
 
-# ── REVIEW BAR (timeline, rewind/forward, speed, LIVE for the selected camera) ─
-PLAYBACK_BAR_H      = 68   # timeline row + buttons row
-PLAYBACK_SEEK_SECONDS = 10  # how far rewind/forward jump per click
+PLAYBACK_BAR_H      = 68
+PLAYBACK_SEEK_SECONDS = 10
 
 TOP_BAR_TIPS = {
     "back": "Back to setup (B)", "log": "System log", "select": "New zone & checks",
@@ -1242,7 +1032,7 @@ def draw_top_bar(total_w, active_panel, edit_mode, selected_paused, hover=None, 
     for key in ("log", "select", "tools", "shift", "power", "edit"):
         active = (active_panel == key) or (key == "edit" and edit_mode)
         _bar_button(canvas, rects, key, key, x, TOP_BAR_H, active, hover)
-        if key == "power" and all_paused and not active:      # everything off: say so
+        if key == "power" and all_paused and not active:
             rounded_rect(canvas, (x-14, 6), (x+14, TOP_BAR_H-6), THEME["warn"], -1, r=6)
             draw_glyph_icon(canvas, "power", x, TOP_BAR_H//2, 17, THEME["black"])
         x += step
@@ -1254,7 +1044,7 @@ def draw_top_bar(total_w, active_panel, edit_mode, selected_paused, hover=None, 
                 selected_paused, hover)
     return canvas, rects
 
-TIMELINE_Y = 15            # centre of the timeline track inside the review bar
+TIMELINE_Y = 15
 REVIEW_SPEEDS = [2, 4, 8, 16]
 
 def _speed_txt(speed):
@@ -1268,26 +1058,18 @@ def _clock(t, with_day=False):
 
 def draw_playback_bar(total_w, selected_paused, selected_name, focus_on=False, hover=None, review=None,
                       spans=None, now=None, rec_on=True):
-    """Bottom bar for the selected camera.
-    Row 1: timeline of its recording, from the start of the footage to NOW
-    (click or drag to jump; recorded stretches lighter, gaps dark).
-    Row 2: fast rewind, back 10 s, pause/play, forward 10 s, fast forward,
-    LIVE - all of these only change what the tile SHOWS; the live picture
-    keeps being analysed. Right: snapshot, enlarge / back to grid.
-    Returns (canvas, rects, timeline) - timeline = (t0, t1, x1, x2) or None."""
     canvas = np.full((PLAYBACK_BAR_H, total_w, 3), THEME["bg_header"], dtype=np.uint8)
     cv2.line(canvas, (0, 0), (total_w, 0), THEME["border"], 1)
     rects = {}; timeline = None
     now = now or time.time()
     font = cv2.FONT_HERSHEY_SIMPLEX
 
-    # ── row 1: timeline ──
     x1, x2 = 150, total_w - 130
     if rec_on and x2 - x1 > 80:
         spans = spans or []
         t1 = now
         t0 = spans[0][0] if spans else now - 60
-        t0 = min(t0, t1 - 60)                     # at least a minute wide
+        t0 = min(t0, t1 - 60)
         span_t = t1 - t0
         tx = lambda t: int(x1 + (x2 - x1) * min(1.0, max(0.0, (t - t0) / span_t)))
         ty = TIMELINE_Y
@@ -1313,7 +1095,6 @@ def draw_playback_bar(total_w, selected_paused, selected_name, focus_on=False, h
     elif not rec_on:
         text_centered(canvas, "Recording is off", total_w // 2, TIMELINE_Y + 4, 0.3, THEME["text_dim"], 1)
 
-    # ── row 2: name + status, transport buttons, LIVE, snapshot / enlarge ──
     cy = TIMELINE_Y + 12 + (PLAYBACK_BAR_H - TIMELINE_Y - 12) // 2
     row = (TIMELINE_Y + 12, PLAYBACK_BAR_H)
     def button(key, glyph, cx, active=False, size=17):
@@ -1365,7 +1146,6 @@ def draw_playback_bar(total_w, selected_paused, selected_name, focus_on=False, h
     return canvas, rects, timeline
 
 def draw_review_badge(tile, rv, now_ts, compact):
-    """Bottom-left pill on a tile that's showing recorded footage."""
     behind = max(0, int(now_ts - rv["t"]))
     m, sec = divmod(behind, 60); hr, m = divmod(m, 60)
     ago = f"-{hr}:{m:02d}:{sec:02d}" if hr else f"-{m}:{sec:02d}"
@@ -1396,8 +1176,6 @@ def _panel_shell(w, h, title):
     return canvas
 
 def build_panel_empty(w, h):
-    """The sidebar's idle state — fixed width, genuinely empty, no header
-    text — filled in only once one of the top-bar icons is clicked."""
     canvas = np.full((h, w, 3), THEME["bg_panel_alt"], dtype=np.uint8)
     cv2.line(canvas, (0, 0), (0, h), THEME["accent"], 2)
     return canvas
@@ -1406,7 +1184,6 @@ TEXT_ENTRY_H = 18
 _alert_thumb_cache = {}
 
 def _alert_thumb(day, entry, bw, bh):
-    """Letterboxed ('contain') thumbnail of a saved alert photo, cached."""
     key = (day, entry["file"], bw, bh)
     hit = _alert_thumb_cache.get(key)
     if hit is not None: return hit
@@ -1431,8 +1208,6 @@ def _pretty_day(day):
     except ValueError: return day
 
 def build_panel_log(w, h, ui):
-    """ui: {"tab": "log"|"alerts", "day", "scroll", "sel"}. Hits are
-    (x1,y1,x2,y2,(action,value))."""
     canvas = _panel_shell(w, h, "ADMIN LOG")
     hits = []
     y = PANEL_HEADER_H + 8
@@ -1458,7 +1233,6 @@ def build_panel_log(w, h, ui):
         put_text(canvas, "scroll wheel to browse", (12, h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.26, THEME["text_dim"], 1)
         return canvas, hits
 
-    # ── ALERTS tab: one day's alert photos, newest first ──
     days = alert_days()
     if ui["day"] not in days: ui["day"] = days[-1]
     di = days.index(ui["day"])
@@ -1497,8 +1271,6 @@ def _fit(text, max_chars):
 
 _fit_px_cache = {}
 def fit_px(text, max_w, scale, thickness=1):
-    """Cuts text to fit max_w pixels in the UI font (cached - panels redraw
-    every frame)."""
     key = (text, max_w, scale, thickness)
     hit = _fit_px_cache.get(key)
     if hit is None:
@@ -1512,10 +1284,6 @@ def fit_px(text, max_w, scale, thickness=1):
     return hit
 
 def build_panel_select(w, h, kind, checks, editing_label, supported, off_zone=None):
-    """Zone builder. In "new zone" mode it sets up what the next drawn zone
-    will be; when editing_label is set, the same controls change an
-    existing zone live instead (opened from the Tools list or the zone's
-    right-click menu). Hits are (x1,y1,x2,y2,(action,value))."""
     canvas = _panel_shell(w, h, "EDIT ZONE" if editing_label else "NEW ZONE")
     hits = []
     y = PANEL_HEADER_H + 10
@@ -1666,8 +1434,6 @@ def build_panel_tools(w, h, zone_editor, cameras, supported):
     return canvas, hits
 
 def build_panel_power(w, h, zone_editor):
-    """Turn ALL zones off for 1-5 hours or until turned back on, or back on.
-    Hits are (x1,y1,x2,y2,(action,value))."""
     canvas = _panel_shell(w, h, "ALL ZONES ON / OFF")
     hits = []; font = cv2.FONT_HERSHEY_SIMPLEX
     total = sum(len(z) for z in zone_editor.zones.values())
@@ -1728,7 +1494,6 @@ def build_panel_help(w, h):
             y += 16
     return canvas, []
 
-# ── FLOATING CONTEXT MENU ─────────────────────────────────────────────────────
 ZONE_MENU_ITEMS = [
     ("Edit Checks", "accent"),
     ("Turn Off / On", "accent"),
@@ -1778,28 +1543,20 @@ def draw_model_warning(frame, missing_items):
     if not missing_items: return
     PW = frame.shape[1]
     msg = "NO MODEL YET: " + ", ".join(CHECK_ITEMS[i]["label"] for i in ordered_checks(missing_items))
-    # Just under the camera-name header (drawn later at y 0-28), so it never
-    # sits under the bottom-right timestamp badge.
     y1, y2 = 28, 50
     cv2.rectangle(frame,(0,y1),(PW,y2),(20,20,60),-1)
     cv2.rectangle(frame,(0,y1),(PW,y2),THEME["warn"],1)
     icon_alert(frame, 14, (y1+y2)//2, 6, THEME["warn"], 1)
     put_text(frame,msg,(26,y2-7),cv2.FONT_HERSHEY_SIMPLEX,0.38,THEME["warn"],1)
 
-# ── SHIFT & AFTER-HOURS ROOM WATCH ────────────────────────────────────────────
-# Outside shift hours (after the end + a short delay for people to leave)
-# each watched camera's room should be dark and empty. Lights are judged
-# from the frame's own brightness - no extra model needed - and people from
-# the person detector that already runs for PPE. What counts as a problem
-# (lights, people, or either) is chosen live from the Shift panel.
 ROOM_MODES = [("lights", "Lights on"), ("people", "People inside"), ("both", "Lights or people")]
-ROOM_SAMPLE_EVERY  = 1.0    # s between brightness samples per camera
-ROOM_SAMPLES       = 10     # brightness is averaged over this many samples
-ROOM_PEOPLE_MEMORY = 3.0    # s a person sighting counts (detector flickers)
-ROOM_ALERT_HOLD    = 15.0   # s a problem must last before it alerts
-ROOM_REALERT       = 30*60  # s before the same ongoing problem alerts again
-ROOM_DEFAULT_LUX   = 60     # mean gray level for "lights on" until calibrated
-ROOM_IR_SAT_MAX    = 3.0    # colourless picture = camera's IR night mode = lights off
+ROOM_SAMPLE_EVERY  = 1.0
+ROOM_SAMPLES       = 10
+ROOM_PEOPLE_MEMORY = 3.0
+ROOM_ALERT_HOLD    = 15.0
+ROOM_REALERT       = 30*60
+ROOM_DEFAULT_LUX   = 60
+ROOM_IR_SAT_MAX    = 3.0
 SHIFT_STEP_MIN     = 15
 
 def default_after_hours():
@@ -1829,9 +1586,9 @@ class RoomWatch:
         self.last_person = defaultdict(float)
         self.people_now  = defaultdict(int)
         self.cond_since  = {}
-        self.last_alert  = {}       # ci -> (ts, reasons)
-        self.status      = {}       # ci -> dict for the panel / tile badge
-        self.simulate    = False    # "test now" - pretend it's after hours
+        self.last_alert  = {}
+        self.status      = {}
+        self.simulate    = False
         self.was_after   = None
 
     @property
@@ -1844,7 +1601,7 @@ class RoomWatch:
         now = now or datetime.now()
         m = now.hour * 60 + now.minute
         st, en = _hm_to_min(self.s["shift_start"]), _hm_to_min(self.s["shift_end"])
-        if st == en: return False                       # 24h shift
+        if st == en: return False
         in_shift = (st <= m < en) if st < en else (m >= st or m < en)
         in_grace = (m - en) % 1440 < int(self.s.get("grace_min", 0))
         return not in_shift and not in_grace
@@ -1861,7 +1618,6 @@ class RoomWatch:
         return ROOM_DEFAULT_LUX
 
     def measure(self, ci, frame, now_ts):
-        """Call with the raw camera frame, before any overlay is drawn on it."""
         if now_ts - self.last_sample[ci] < ROOM_SAMPLE_EVERY: return
         self.last_sample[ci] = now_ts
         small = cv2.resize(frame, (64, 48), interpolation=cv2.INTER_AREA)
@@ -1890,7 +1646,6 @@ class RoomWatch:
         self.save(); return True
 
     def tick(self):
-        """Once per loop: logs shift start/end transitions."""
         if not self.s["enabled"]:
             self.was_after = None; return
         after = self.is_after_hours()
@@ -1904,8 +1659,6 @@ class RoomWatch:
         self.was_after = after
 
     def update(self, ci, frame, n_people, now_ts, cam_name):
-        """Call after person detection ran on this frame; frame is the photo
-        sent with an alert. Returns the status drawn on the tile."""
         if n_people: self.last_person[ci] = now_ts; self.people_now[ci] = n_people
         elif now_ts - self.last_person[ci] > ROOM_PEOPLE_MEMORY: self.people_now[ci] = 0
         lit = self.lights_on(ci); people = self.people_now[ci]
@@ -1938,14 +1691,12 @@ class RoomWatch:
             when = "Test mode" if self.simulate else f"Shift ended at {fmt_12h(self.s['shift_end'])}"
             msg = (f"After-hours alert CAM{ci+1} ({cam_name})!\n" + "\n".join(lines) +
                    f"\n{when}\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            send_telegram_photo(msg, frame, cooldown=0)   # RoomWatch rate-limits itself
+            send_telegram_photo(msg, frame, cooldown=0)
             record_web_event(msg, frame.copy(), THEME["warn"], cam=ci)
             log_file("AFTER_HOURS", f"cam{ci+1},{'+'.join(st['reasons'])},{people}")
         return st
 
 def draw_room_badge(frame, st):
-    """Bottom-left of a tile, only while its room is being watched after
-    hours: state pill + lights + people (the timestamp sits bottom-right)."""
     if not st or not st["watched"] or not st["after"]: return
     PH = frame.shape[0]
     y1, y2 = PH - 28, PH - 6
@@ -1971,8 +1722,6 @@ def draw_room_badge(frame, st):
     put_text(frame, ppl_txt, (x + 20, y2 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.38, pc, 1, cv2.LINE_AA)
 
 def build_panel_shift(w, h, rw, cameras, selected_cam):
-    """Shift hours + after-hours room watch settings, all live. Hits are
-    (x1,y1,x2,y2,(action,value))."""
     canvas = _panel_shell(w, h, "SHIFT & ROOM WATCH")
     s = rw.s; hits = []
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -2051,7 +1800,6 @@ def build_panel_shift(w, h, rw, cameras, selected_cam):
             put_text(canvas, "reset", (w-14-tw, y+10), font, 0.28, THEME["accent"], 1, cv2.LINE_AA)
             hits.append((w-20-tw, y-2, w-8, y+14, ("calib", "reset")))
 
-    # status line + test button pinned to the bottom
     by2 = h - 10; by1 = by2 - 28
     if not s["enabled"]:
         now_txt, now_col = "Room watch is OFF", THEME["text_dim"]
@@ -2070,19 +1818,12 @@ def build_panel_shift(w, h, rw, cameras, selected_cam):
     hits.append((10, by1, w-10, by2, ("test", None)))
     return canvas, hits
 
-# ── PROCESS FRAME ─────────────────────────────────────────────────────────────
 class PersonDetector:
-    """Runs the person model on its own thread so the video never waits for
-    it: the main loop hands over each camera's newest frame, the thread
-    works through cameras oldest-first and keeps the latest result per
-    camera (boxes + the exact frame they were found in, so PPE crops line
-    up with them). On a fast PC that's every frame; on a weak laptop it
-    just updates less often while the picture stays smooth."""
     def __init__(self, model, conf=0.45):
         self.model = model; self.conf = conf
         self.cv = threading.Condition()
-        self.pending = {}          # ci -> (frame, ts) waiting to be analysed
-        self.results = {}          # ci -> (boxes, frame, ts, full-resolution frame)
+        self.pending = {}
+        self.results = {}
         self.running = True
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -2102,7 +1843,7 @@ class PersonDetector:
             with self.cv:
                 while self.running and not self.pending: self.cv.wait()
                 if not self.running: return
-                ci = min(self.pending, key=lambda c: self.pending[c][1])   # oldest frame first
+                ci = min(self.pending, key=lambda c: self.pending[c][1])
                 frame, ts, raw = self.pending.pop(ci)
             boxes = []
             try:
@@ -2115,11 +1856,6 @@ class PersonDetector:
             with self.cv: self.results[ci] = (boxes, frame, ts, raw)
 
 def process_cam_frame(frame, ci, zone_editor, now_ts, detection, pw=None, ph=None):
-    """detection = (boxes, frame they were found in, time, full-res frame)
-    from PersonDetector. Crops and alert photos come from that same frame;
-    the PPE models get their crop from the camera's FULL resolution, since
-    gloves and goggles are only a few pixels big at PROC size (a 2520x1080
-    camera shrunk to 960x720 keeps 38% of its width). Returns what to draw."""
     if pw is None: pw = frame.shape[1]
     if ph is None: ph = frame.shape[0]
     zones   = [z for z in zone_editor.get_zones(ci) if zone_on(z, now_ts)]
@@ -2129,7 +1865,7 @@ def process_cam_frame(frame, ci, zone_editor, now_ts, detection, pw=None, ph=Non
         boxes, frame = detection[0], detection[1]
         raw = detection[3] if len(detection) > 3 else None
     seen_ids = set()
-    draws    = []   # (x1, y1, x2, y2, colour, label) in this frame's pixels
+    draws    = []
     supported = supported_items()
 
     for (x1, y1, x2, y2) in boxes:
@@ -2137,9 +1873,6 @@ def process_cam_frame(frame, ci, zone_editor, now_ts, detection, pw=None, ph=Non
         tid    = get_track(ci, cx, cy)
         t      = tracked[tid]; t["cx"],t["cy"] = cx,cy; seen_ids.add(tid)
 
-        # A person can stand in several zones at once (e.g. a helmet zone
-        # overlapping a smoking zone) - they're held to the union of all of
-        # their checks, plus whatever a trigger zone they passed armed.
         in_rest = False; zone_checks = set(); trig_checks = set(); entry_zone = None
         for zone in zones:
             if not zone_editor.box_in_zone(zone, x1, y1, x2, y2, pw=pw, ph=ph): continue
@@ -2190,18 +1923,14 @@ def process_cam_frame(frame, ci, zone_editor, now_ts, detection, pw=None, ph=Non
 
         elif armed:
             evaluable = active & supported
-            res = t.pop("ppe_result", None)          # from the PPE worker
+            res = t.pop("ppe_result", None)
             if res is not None:
                 t["ppe_busy"] = False; t["cached"] = res
                 for i, good in res.items():
                     if CHECK_ITEMS[i]["kind"] == "behavior":
                         t["behavior_hist"][i].append(not good)
             cached = t["cached"]
-            waiting = not evaluable <= set(cached)    # first result not back yet
-            # Re-check on the normal interval, or right away if this person
-            # just walked into a zone asking for something not checked yet.
-            # One smoking sighting not yet confirmed: look again sooner, so
-            # a real smoker is confirmed (and alerted) within about a second.
+            waiting = not evaluable <= set(cached)
             unconfirmed = any(CHECK_ITEMS[i]["kind"] == "behavior" and 0 < sum(t["behavior_hist"][i]) < BEHAVIOR_MIN_HITS
                               for i in evaluable)
             interval = BEHAVIOR_RECHECK if unconfirmed else PPE_INTERVAL
@@ -2219,15 +1948,9 @@ def process_cam_frame(frame, ci, zone_editor, now_ts, detection, pw=None, ph=Non
                 elif not cached.get(i, False):
                     failing.add(i)
             ok = not failing
-            # Smoking is never "someone adjusting their helmet": no grace
-            # period and no Telegram delay - it alerts as soon as confirmed.
             behavior_now = any(CHECK_ITEMS[i]["kind"] == "behavior" for i in failing)
             grace = 0 if behavior_now else GRACE_PERIOD
             alert_delay = 0 if behavior_now else TELEGRAM_PPE_DELAY
-            # Seen once but not yet confirmed: that's "still checking", not
-            # "OK" - marking it OK would make the confirming sighting look
-            # like an OK->violation change and apply the GRACE_PERIOD meant
-            # for someone briefly adjusting a helmet.
             pending = waiting or ok and any(CHECK_ITEMS[i]["kind"] == "behavior" and sum(t["behavior_hist"][i]) > 0
                                  for i in evaluable)
 
@@ -2266,14 +1989,6 @@ def process_cam_frame(frame, ci, zone_editor, now_ts, detection, pw=None, ph=Non
                         bc=THEME["danger"]; lbl=f"VIOLATION: {t['missing']}{tag}"
                         add_log(f"CAM{ci+1} VIOLATION: {t['missing']}", THEME["danger"])
                         log_file("PPE_VIOLATION", f"cam{ci+1},{t['missing']}")
-                        # One alert per continuous tracked violation "episode" -
-                        # violation_alerted latches True the first time this
-                        # worker's alert actually goes out and is only cleared
-                        # by PPE becoming OK or leaving the zone (see below), or
-                        # implicitly by tracking loss creating a fresh track (a
-                        # new tid never has this flag set). Without this gate,
-                        # a worker who just stays in continuous violation would
-                        # re-trigger every TELEGRAM_PPE_DELAY seconds forever.
                         if not t["violation_alerted"]:
                             if t["telegram_violation_start"] is None:
                                 t["telegram_violation_start"]=now_ts
@@ -2323,8 +2038,6 @@ def process_cam_frame(frame, ci, zone_editor, now_ts, detection, pw=None, ph=Non
     return draws, unchecked
 
 def draw_person_overlays(tile, draws, sx, sy, compact):
-    """Draws process_cam_frame's boxes on a display tile of any size, with
-    the label on a solid chip so it stays readable on any background."""
     fs = max(0.34, min(0.6, 0.69 * sx))
     for (x1, y1, x2, y2, col, lbl) in draws:
         X1, Y1, X2, Y2 = int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy)
@@ -2338,21 +2051,15 @@ def draw_person_overlays(tile, draws, sx, sy, compact):
                  THEME["black"] if dark else THEME["white"], 1)
 
 def shade(img, x1, y1, x2, y2, color, alpha=0.7):
-    """Semi-transparent filled box - tile headers/badges read as overlays
-    on the video instead of hard blocks."""
     x1, y1 = max(0, x1), max(0, y1); x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
     if x1 >= x2 or y1 >= y2: return
     roi = img[y1:y2, x1:x2]
     roi[:] = (roi.astype(np.float32) * (1 - alpha) + np.array(color, np.float32) * alpha).astype(np.uint8)
 
 STRIP_GAP      = 8
-COMPACT_TILE_H = 170    # tiles shorter than this get the slim header and no labels
+COMPACT_TILE_H = 170
 
 def compute_tiles(n, cols, rows, PW, PH, focus, aspect):
-    """Where each camera goes in the grid area: rects[ci] = (x, y, w, h).
-    Normal view is the plain grid; with focus set (double-click) that camera
-    is shown large, keeping its own aspect ratio, and the others sit in a
-    strip underneath. Returns (rects, grid_w, grid_h, strip_y or None)."""
     gw, gh = cols*PW, rows*PH
     if focus is None:
         return [((i % cols)*PW, (i // cols)*PH, PW, PH) for i in range(n)], gw, gh, None
@@ -2372,10 +2079,6 @@ def compute_tiles(n, cols, rows, PW, PH, focus, aspect):
     return rects, gw, gh, strip_y
 
 def add_entry_context_menu(entry):
-    """tk.Entry has NO right-click menu by default — only bare Ctrl+V paste,
-    which isn't obvious. This adds Cut/Copy/Paste/Select All on right-click,
-    the way every other app behaves, so pasting a Telegram token/URL just
-    works the way people expect."""
     menu = tk.Menu(entry, tearoff=0, bg=UI["panel"], fg=UI["text"],
                     activebackground=UI["accent"], activeforeground="#0c0f13")
     menu.add_command(label="Cut",        command=lambda: entry.event_generate("<<Cut>>"))
@@ -2390,9 +2093,6 @@ def add_entry_context_menu(entry):
     return entry
 
 def mask_camera_source(src):
-    """Hides an embedded rtsp://user:pass@... password so it never shows up
-    in the on-screen camera list during a live demo (still stored in full in
-    system_config.json, same as the Telegram token already is)."""
     src = str(src)
     if "://" not in src or "@" not in src: return src
     try:
@@ -2406,9 +2106,6 @@ def mask_camera_source(src):
         return src
 
 class IPCameraDialog(tk.Toplevel):
-    """Add a networked camera (NVR channel, IP camera, ONVIF) by RTSP/HTTP
-    URL, with a background-threaded 'Test Connection' so a bad IP or an
-    offline camera never freezes the dialog while probing it."""
     EXAMPLES = ("Hikvision:  rtsp://user:pass@IP:554/Streaming/Channels/101\n"
                 "Dahua:      rtsp://user:pass@IP:554/cam/realmonitor?channel=1&subtype=0\n"
                 "Generic ONVIF:  rtsp://user:pass@IP:554/onvif1")
@@ -2505,13 +2202,11 @@ class IPCameraDialog(tk.Toplevel):
         self.result=None
         self.destroy()
 
-# ── SETUP GUI ─────────────────────────────────────────────────────────────────
 UI = {
     "bg":"#121214","panel":"#1a1a1e","field":"#232328","border":"#37373a",
     "accent":"#2196f3","accent_hi":"#1e88e5","danger":"#eb4646","danger_hi":"#d63c3c",
     "success":"#5ac878","success_hi":"#4bb468","text":"#e6e6eb","text_dim":"#96969b",
 }
-# Tk can use the same Windows icon font as the monitor's top bar.
 TK_ICON_CODES = {"camera": 0xE714, "telegram": 0xE724, "clock": 0xE823,
                  "shield": 0xEA18, "globe": 0xE774}
 
@@ -2526,9 +2221,6 @@ class SetupApp:
             except: pass
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build()
-        # Size the window to fit whatever sections _build() packed instead of
-        # a hardcoded height — the REMOTE ACCESS section added enough content
-        # that a fixed 740x620 was clipping the Launch button off the bottom.
         self.root.update_idletasks()
         w = max(740, self.root.winfo_reqwidth())
         h = self.root.winfo_reqheight()
@@ -2550,9 +2242,6 @@ class SetupApp:
         return b
 
     def _icon(self,parent,kind,size=18,color=None,bg=None):
-        """Small hand-drawn glyph on a tk.Canvas — same vector-icon approach
-        as the OpenCV monitor window, so no external image assets are needed
-        and nothing has to be added to the PyInstaller .spec datas=[]."""
         color=color or UI["accent"]; bg=bg or UI["panel"]
         try:
             import tkinter.font as tkfont
@@ -2714,10 +2403,6 @@ class SetupApp:
             self._maybe_start_remote_early()
 
     def _maybe_start_remote_early(self):
-        """Starts the tunnel as soon as it's turned on in Setup, instead of
-        waiting for Launch — so the public link (and the fact that it's a
-        fresh one this run) is visible and copyable right here, in a real
-        Tk field, instead of only as unselectable pixels in the OpenCV log."""
         user = self.rem_user.get().strip()
         new_pass = self.rem_pass.get()
         if new_pass and generate_password_hash:
@@ -2780,60 +2465,34 @@ class SetupApp:
         self.root.mainloop()
         return self.cfg if self.launched else None
 
-# ── REMOTE ACCESS (local web dashboard + Cloudflare Tunnel) ────────────────────
-# Optional layer: serves the exact same combined grid+bar image the OpenCV
-# window shows, as an MJPEG stream behind a login, over a normal HTTP server.
-# Whichever machine runs this app just opens an outbound tunnel to reach the
-# same kind of public link — no port-forwarding, no fixed IP needed, and the
-# tunnel provides HTTPS to the browser even though Flask itself only ever
-# speaks plain HTTP on localhost.
 REMOTE_PORT = 8787
 _frame_lock = threading.Lock()
 latest_frame_jpeg = None
 _remote_state = {"flask_started": False, "cloudflared_proc": None, "url": None, "last_encode": 0.0,
                   "watchdog_started": False}
-WEB_ENCODE_INTERVAL = 0.15  # ~6-7fps for the outbound web stream, independent of the local display fps
+WEB_ENCODE_INTERVAL = 0.15
 
-# cloudflared's own local diagnostics server (always on 127.0.0.1:20241 by
-# default) - used to detect when the tunnel process is alive but has quietly
-# lost its connection to Cloudflare's edge (see _tunnel_watchdog).
 TUNNEL_METRICS_PORT   = 20241
-TUNNEL_CHECK_INTERVAL = 15   # seconds between health checks
-TUNNEL_UNREADY_LIMIT  = 3    # consecutive failed checks before restarting the tunnel
+TUNNEL_CHECK_INTERVAL = 15
+TUNNEL_UNREADY_LIMIT  = 3
 
-# Each viewer's MJPEG generator times how long its own socket write actually
-# takes (see _mjpeg_generator) and folds that into this running average —
-# a slow/congested connection makes writes take longer, so this is a decent
-# proxy for "how much bandwidth is actually available right now" without
-# needing a real ABR protocol. publish_web_frame reads it to pick quality.
 _net_stats = {"avg_write_ms": 25.0}
 _net_stats_lock = threading.Lock()
 
 def _pick_quality_and_scale():
-    # Thresholds are calibrated for real internet round-trips through the
-    # tunnel (typically 100-400ms even on a perfectly fine connection), not
-    # localhost — treating that as "slow" was making the stream shrink for
-    # everyone. Only genuinely struggling connections drop resolution now.
     with _net_stats_lock:
         ms = _net_stats["avg_write_ms"]
     if   ms < 250:  return 80, 0.6
     elif ms < 600:  return 65, 0.5
     elif ms < 1200: return 50, 0.4
     elif ms < 2500: return 35, 0.3
-    else:          return 22, 0.2    # very slow: keep it moving over clarity
+    else:          return 22, 0.2
 
-# ── WEB EVENTS (violations / rest-area entries, shown on the dashboard
-# itself instead of only Telegram) ──────────────────────────────────────────
 WEB_EVENTS_MAX = 30
 web_events = []
 _web_events_lock = threading.Lock()
 _web_event_seq = [0]
 
-# ── DAILY ALERTS ──────────────────────────────────────────────────────────────
-# Every alert photo is also saved to alerts/<day>/ with a line in
-# alerts.jsonl (time, camera, title, file) - the Admin Log's ALERTS tab
-# shows them per day, and a double-click plays that camera's recording
-# from just before the alert.
 ALERTS_DIR = "alerts"
 _alert_days = {}
 _alert_lock = threading.Lock()
@@ -2879,10 +2538,6 @@ def alert_days():
     return sorted(days)
 
 def record_web_event(msg, image, color=None, cam=None, alert=True):
-    """Mirrors what gets sent to Telegram: the photo goes to the web
-    dashboard's in-memory gallery (polled via /events), the text to the
-    Admin Log, and - for alerts (alert=True with a camera) - to the daily
-    alerts folder shown in the Admin Log's ALERTS tab."""
     if image is None or image.size == 0: return
     try:
         ok, enc = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -3028,7 +2683,7 @@ poll(); setInterval(poll, 4000);
             if _remote_login_ok(request.form.get("username", ""), request.form.get("password", "")):
                 session["auth"] = True
                 return redirect(url_for("_route_index"))
-            time.sleep(1)  # light brute-force slowdown, not real rate limiting
+            time.sleep(1)
             error = "Invalid username or password"
         return render_template_string(LOGIN_HTML, error=error)
 
@@ -3049,14 +2704,11 @@ poll(); setInterval(poll, 4000);
             if frame_bytes:
                 t0 = time.time()
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
-                # the generator only regains control once Werkzeug has
-                # actually written the chunk to the socket, so this is a
-                # real (if approximate) read on this viewer's connection speed
                 write_ms = (time.time()-t0)*1000
                 if write_ms < 5000:
                     with _net_stats_lock:
                         _net_stats["avg_write_ms"] = _net_stats["avg_write_ms"]*0.85 + write_ms*0.15
-            time.sleep(0.1)  # caps the web stream around ~10fps independent of local display
+            time.sleep(0.1)
 
     @web_app.route("/stream.mjpg")
     def _route_stream():
@@ -3084,10 +2736,6 @@ def find_cloudflared():
     return shutil.which("cloudflared")
 
 def publish_web_frame(camera_grid):
-    """Called once per render loop iteration with the camera-only grid (no
-    top bar, no sidebar — those are local operator controls, not something
-    a remote viewer needs). Quality/resolution adapt automatically to how
-    fast viewers' connections are actually keeping up (see _pick_quality_and_scale)."""
     if not FLASK_AVAILABLE: return
     now = time.time()
     if now - _remote_state["last_encode"] < WEB_ENCODE_INTERVAL: return
@@ -3095,10 +2743,6 @@ def publish_web_frame(camera_grid):
     global latest_frame_jpeg
     try:
         quality, scale = _pick_quality_and_scale()
-        # the browser always stretches this to fill the viewer's screen
-        # (see .video-wrap img{width:100%;height:100%}), so even the worst
-        # tier needs enough real detail not to look absurd blown up on a
-        # phone or a big monitor — floor is higher than the old 160x120.
         w = max(480, int(camera_grid.shape[1]*scale))
         h = max(360, int(camera_grid.shape[0]*scale))
         small = cv2.resize(camera_grid, (w, h))
@@ -3142,25 +2786,11 @@ def start_remote_access(cfg):
     def run_tunnel():
         try:
             proc = subprocess.Popen(
-                # --protocol http2 forces the tunnel over plain TCP instead of
-                # cloudflared's default QUIC/UDP - many routers/campus networks
-                # drop long-lived UDP after a while, which silently kills a
-                # QUIC tunnel while the process keeps running (looks "alive"
-                # but has zero real connections - see _tunnel_watchdog).
                 [cloudflared_path, "tunnel", "--protocol", "http2",
                  "--url", f"http://127.0.0.1:{REMOTE_PORT}"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                # Without this, launching a console program (cloudflared.exe)
-                # from a windowed/no-console app (this one, once built with
-                # console=False) makes Windows pop up a brand new visible
-                # console window for the child process - that's the "cmd
-                # window" that appeared on Launch. This suppresses it; stdout
-                # is still captured normally via the pipe above.
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             _remote_state["cloudflared_proc"] = proc
-            # Keep draining stdout for the process's whole life (not just
-            # until the URL line shows up) so its output pipe never fills up
-            # and blocks its own logging/operation.
             for line in proc.stdout:
                 if not _remote_state.get("url"):
                     m = re.search(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com", line)
@@ -3183,12 +2813,6 @@ def _tunnel_is_ready():
         return False
 
 def _tunnel_watchdog(cfg):
-    """cloudflared can stay alive as a process while its actual connection to
-    Cloudflare's edge is dead (common on networks that drop long-lived UDP) -
-    the public link then looks fine from here but returns an error page for
-    every real visitor. Poll cloudflared's own /ready endpoint periodically
-    and restart the tunnel if it's been disconnected too long, so a demo
-    audience never hits a dead link without the presenter noticing."""
     bad_checks = 0
     while True:
         time.sleep(TUNNEL_CHECK_INTERVAL)
@@ -3224,32 +2848,21 @@ def _cleanup_remote_tunnel():
         try: proc.terminate()
         except Exception: pass
 
-# ── MAIN MONITOR ──────────────────────────────────────────────────────────────
-CAM_OPEN_TIMEOUT     = 6.0   # seconds to wait before giving up on a camera/stream
-CAM_RECONNECT_AFTER  = 20    # consecutive failed reads before attempting reconnect
-CAM_RECONNECT_COOLDOWN = 5.0 # min seconds between reconnect attempts, per camera
+CAM_OPEN_TIMEOUT     = 6.0
+CAM_RECONNECT_AFTER  = 20
+CAM_RECONNECT_COOLDOWN = 5.0
 
-# ── RECORDING (DVR) ───────────────────────────────────────────────────────────
-# Every camera is recorded continuously, WITH what the system drew on it
-# (zones, boxes, OK/VIOLATION labels, time), so reviewing footage shows
-# exactly what was detected then - nothing is re-analysed on playback, so
-# review costs no GPU and can never raise an alert. Frames are JPEGs
-# appended to 5-minute segment files plus a small index (time, offset,
-# size) per frame; unlike an .mp4 this is readable while it's still being
-# written, so even the last few seconds can be rewound. Encoding runs on a
-# thread per camera (~1-2 ms a frame). Measured ~0.75 GB/hour/camera;
-# old days and anything over the size cap are deleted automatically.
 REC_DIR        = "recordings"
 REC_W, REC_H   = 640, 480
 REC_FPS        = 10
 REC_JPEG_Q     = 70
 REC_SEGMENT_S  = 300
-REC_KEEP_DAYS  = 3      # config "recording_keep_days"
-REC_MAX_GB     = 30     # config "recording_max_gb"
-REC_IDX        = struct.Struct("<dQI")   # frame time, offset, size
+REC_KEEP_DAYS  = 3
+REC_MAX_GB     = 30
+REC_IDX        = struct.Struct("<dQI")
 REVIEW_STEP_S  = PLAYBACK_SEEK_SECONDS
-LIVE_EDGE_S    = 1.5    # playback this close to now = back to live
-ALERT_PREROLL_S = 8     # an alert's playback starts this long before it
+LIVE_EDGE_S    = 1.5
+ALERT_PREROLL_S = 8
 
 def _rec_cam_dir(day, ci):
     return os.path.join(REC_DIR, day, f"cam{ci+1}")
@@ -3259,7 +2872,7 @@ class CamRecorder:
         self.ci = ci
         self.q = queue.Queue(maxsize=REC_FPS * 3)
         self.last_put = 0.0
-        self.seg = None          # (start_ts, day, data file, index file)
+        self.seg = None
         threading.Thread(target=self._run, daemon=True).start()
 
     def wants(self, ts):
@@ -3268,7 +2881,7 @@ class CamRecorder:
     def offer(self, ts, frame):
         self.last_put = ts
         try: self.q.put_nowait((ts, frame))
-        except queue.Full: pass          # disk too slow: drop a frame, never stall the UI
+        except queue.Full: pass
 
     def close(self):
         self.q.put((None, None))
@@ -3306,11 +2919,10 @@ class CamRecorder:
                 print(f"[RECORDER ERROR] cam{self.ci+1}: {e}"); self._close_seg()
 
 class RecordingReader:
-    """Finds the recorded frame for any moment of one camera's footage."""
     def __init__(self, ci):
         self.ci = ci
-        self._segs = {}     # day -> (listed_at, [(start_ts, base)])
-        self._idx = {}      # base -> [bytes_parsed, [times], [(off, size)]]
+        self._segs = {}
+        self._idx = {}
         self._last = None; self._last_img = None
         self._spans = None; self._span_cache = {}
 
@@ -3331,8 +2943,6 @@ class RecordingReader:
         return first, last
 
     def spans(self):
-        """[(start, end)] of this camera's recorded footage on all kept
-        days, touching segments merged (cached ~2 s) - for the timeline."""
         now = time.time()
         if self._spans and now - self._spans[0] < 2.0: return self._spans[1]
         try: days = sorted(d for d in os.listdir(REC_DIR) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d))
@@ -3367,7 +2977,7 @@ class RecordingReader:
         ent = self._idx.setdefault(base, [0, [], []])
         try:
             size = os.path.getsize(base + ".idx")
-            if size - ent[0] >= REC_IDX.size:            # parse only what was appended
+            if size - ent[0] >= REC_IDX.size:
                 with open(base + ".idx", "rb") as f:
                     f.seek(ent[0]); raw = f.read(size - ent[0])
                 n = len(raw) // REC_IDX.size
@@ -3380,8 +2990,6 @@ class RecordingReader:
         return ent
 
     def frame_at(self, t):
-        """(frame_time, image) of the newest frame at or before t, or
-        (None, None) if nothing was recorded within 2 s of t."""
         segs = self._segments(datetime.fromtimestamp(t).strftime("%Y-%m-%d"))
         j = bisect.bisect_right([st for st, _ in segs], t) - 1
         if j < 0: return None, None
@@ -3407,8 +3015,6 @@ class RecordingReader:
         return False
 
 def rec_cleanup(keep_days, max_gb):
-    """Deletes recording days older than keep_days, then the oldest segments
-    while the total is over max_gb (never a segment still being written)."""
     if not os.path.isdir(REC_DIR): return
     today = datetime.now().date()
     for d in os.listdir(REC_DIR):
@@ -3448,11 +3054,9 @@ def start_rec_cleanup(keep_days, max_gb):
     threading.Thread(target=loop, daemon=True).start()
 
 def make_rec_frame(proc, ci, cam_name, draws, zone_editor):
-    """The frame that gets recorded: analysis frame + zones + detections + time."""
     fr = cv2.resize(proc, (REC_W, REC_H), interpolation=cv2.INTER_LINEAR)
     zone_editor.draw_zones(fr, ci, False, pw=REC_W, ph=REC_H)
     draw_person_overlays(fr, draws, REC_W / PROC_W, REC_H / PROC_H, False)
-    # date/time bottom-right (the tile header covers the top when replayed)
     stamp = datetime.now().strftime('%Y-%m-%d  %H:%M:%S')
     (sw, sh), _ = text_size(stamp, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
     shade(fr, REC_W-sw-18, REC_H-sh-18, REC_W-4, REC_H-4, THEME["bg_header"], 0.7)
@@ -3466,11 +3070,7 @@ def _is_live_source(src):
         return not os.path.isfile(str(src))
 
 class LatestFrameCapture:
-    """Live cameras (webcam / IP / RTSP) are read on their own thread, keeping
-    only the newest frame. Read inline, every loop waited on each camera in
-    turn, and a stream that buffers showed up as stutter and growing lag.
-    Video files are NOT wrapped - they must play frame by frame."""
-    STALE_AFTER = 2.0     # s without a new frame before reads report failure
+    STALE_AFTER = 2.0
 
     def __init__(self, cap):
         self.cap = cap; self._lock = threading.Lock()
@@ -3491,7 +3091,6 @@ class LatestFrameCapture:
 
     @property
     def starting(self):
-        """Still waiting for the first frame - not a failure yet."""
         return self._frame is None and time.time() - self._t0 < CAM_OPEN_TIMEOUT
 
     def read(self):
@@ -3501,22 +3100,19 @@ class LatestFrameCapture:
             return True, self._frame
 
     def get(self, prop):
-        if prop == cv2.CAP_PROP_FRAME_COUNT: return 0     # live: nothing to seek in
+        if prop == cv2.CAP_PROP_FRAME_COUNT: return 0
         return self.cap.get(prop)
 
     def set(self, prop, value):
-        return False      # never touch the capture from this thread while _run reads it
+        return False
 
     def release(self):
         self._running = False
         self._th.join(timeout=1.0)
-        if not self._th.is_alive():      # a read stuck on a dead stream: just leave it
+        if not self._th.is_alive():
             self.cap.release()
 
 def resolve_source(src):
-    """Camera list copied from another PC (e.g. on a USB stick): a video
-    file path that doesn't exist here is looked for by its file name in a
-    'videos' folder next to the program."""
     s_ = str(src)
     if "://" in s_ or os.path.isfile(s_): return src
     try:
@@ -3530,12 +3126,6 @@ def resolve_source(src):
     return src
 
 def open_capture(src, timeout=CAM_OPEN_TIMEOUT):
-    """Opens a VideoCapture on a background thread with a hard timeout, so an
-    unreachable IP camera / RTSP stream (bad IP, offline NVR, network drop)
-    can never hang the whole app at startup or during a reconnect. The worker
-    thread is a daemon: if it's still stuck when the timeout hits, we just
-    give up and move on — the thread dies with the process, it won't be
-    retried or joined again."""
     src = resolve_source(src)
     result = {"cap": None}
     def worker():
@@ -3558,13 +3148,6 @@ def open_capture(src, timeout=CAM_OPEN_TIMEOUT):
     return LatestFrameCapture(cap) if _is_live_source(src) else cap
 
 def open_captures_parallel(cameras):
-    """Opens every camera at once instead of one after another — with 3-4
-    cameras that each take a second or two (worse for IP/RTSP), sequential
-    opening made the whole app look frozen for several seconds right after
-    clicking Launch, before the window even appeared. Each open_capture()
-    call already runs its own watchdog thread internally, so running them
-    from N parallel threads here turns total wait time from sum(...) into
-    roughly max(...)."""
     caps = [None]*len(cameras)
     def worker(i, src):
         caps[i] = open_capture(src)
@@ -3587,9 +3170,6 @@ def run_monitor(cfg, person_model):
     if cfg.get("remote_enabled"):
         start_remote_access(cfg)
 
-    # Windows' default 15.6 ms timer tick rounds every short waitKey() up to
-    # 16/31 ms, which alone cost ~10 fps; 1 ms resolution for this process
-    # (what video players do) lets the frame pacing below actually work.
     if sys.platform == "win32":
         try:
             import ctypes; ctypes.windll.winmm.timeBeginPeriod(1)
@@ -3600,15 +3180,11 @@ def run_monitor(cfg, person_model):
     if not cameras: return False
 
     n=len(cameras)
-    if   n<=1: cols=1; base_pw=960   # single camera gets a genuinely large view
+    if   n<=1: cols=1; base_pw=960
     elif n<=4: cols=2; base_pw=640
     elif n<=9: cols=3; base_pw=480
     else:      cols=4; base_pw=400
     rows=(n+cols-1)//cols
-    # PW/PH are re-derived from the actual OS window size every frame below
-    # (search MIN_TILE_W) so the whole UI stays crisp — never stretched — at
-    # any window size the user drags to. These starting values just pick a
-    # sane initial window size before the first resize event.
     PW=base_pw; PH=int(PW*3/4)
     grid_w=cols*PW
 
@@ -3619,16 +3195,8 @@ def run_monitor(cfg, person_model):
     WIN=APP_NAME
     cv2.namedWindow(WIN,cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, grid_w+PANEL_W, TOP_BAR_H+rows*PH+PLAYBACK_BAR_H)
-    # NOTE: setting the OpenCV/taskbar icon here (immediately after
-    # namedWindow) is unreliable - FindWindowW can fail to locate the
-    # window before it's actually mapped on screen. The real call happens
-    # once, after the first cv2.imshow() below (search for _icon_applied).
     _icon_applied = False
 
-    # Show *something* immediately — opening cameras (especially IP/RTSP)
-    # can take a few seconds each; doing that before the window ever
-    # appears is exactly what made the app look frozen right after
-    # clicking Launch. Cameras below open in parallel, not one by one.
     loading = np.full((TOP_BAR_H+rows*PH+PLAYBACK_BAR_H, grid_w+PANEL_W, 3), THEME["bg_panel"], dtype=np.uint8)
     text_centered(loading, "Opening cameras...", (grid_w+PANEL_W)//2,
                   (TOP_BAR_H+rows*PH+PLAYBACK_BAR_H)//2, 1.0, THEME["accent"], 2)
@@ -3650,19 +3218,17 @@ def run_monitor(cfg, person_model):
     frame_delay=max(1,int(1000/fps))
 
     edit_mode=False; drawing_zone=False
-    # What the next drawn zone will be (set in the Select panel), and which
-    # existing zone - if any - that same panel is currently editing.
     new_zone_kind="ppe_check"; new_zone_checks=set(DEFAULT_CHECKS)
-    editing_zone=None      # (ci, zi) or None
+    editing_zone=None
     zone_menu_visible=False; active_menu_cam=None; zone_menu_pos=(0,0)
     new_zone_pts=[]; active_draw_cam=0
     quit_requested=False; back_requested=False
     active_panel=None
     selected_cam=0
-    focus_cam=None               # camera shown large (double-click), or None = grid
-    last_click=[0.0,None]        # (time, camera) of the last click, for double-click
-    cam_overlays={}              # ci -> (draws, unchecked) from process_cam_frame
-    reviews={}                   # ci -> {"t","paused","tick","alert"}: tile shows recorded footage
+    focus_cam=None
+    last_click=[0.0,None]
+    cam_overlays={}
+    reviews={}
     readers=[RecordingReader(i) for i in range(n)]
     rec_on=cfg.get("recording_enabled", True)
     recorders=[CamRecorder(i) for i in range(n)] if rec_on else [None]*n
@@ -3689,8 +3255,6 @@ def run_monitor(cfg, person_model):
         reviews[ci]={"t":min(t,now), "paused":paused, "tick":now, "alert":alert, "speed":1}
 
     def review_cmd(key, ci=None):
-        """Rewind / forward / pause / live for one camera's tile. Only what
-        the tile SHOWS changes - its live picture keeps being analysed."""
         ci = selected_cam if ci is None else ci
         rv = reviews.get(ci); now = time.time()
         if key=="rewind":
@@ -3702,11 +3266,11 @@ def run_monitor(cfg, person_model):
                 if rv["t"] >= now - LIVE_EDGE_S: reviews.pop(ci, None)
         elif key=="pauseplay":
             if rv is None:  start_review(ci, now, paused=True)
-            elif rv["paused"] or rv["speed"] != 1:      # play = normal speed
+            elif rv["paused"] or rv["speed"] != 1:
                 rv["paused"] = False; rv["speed"] = 1; rv["tick"] = now
             else:           rv["paused"] = True
         elif key=="ffwd":
-            if rv:       # nothing to fast-forward into while already live
+            if rv:
                 sp = rv["speed"]
                 rv["speed"] = next((v for v in REVIEW_SPEEDS if v > sp), REVIEW_SPEEDS[0]) if sp >= 1 else REVIEW_SPEEDS[0]
                 rv["paused"] = False; rv["tick"] = now
@@ -3721,7 +3285,6 @@ def run_monitor(cfg, person_model):
             reviews.pop(ci, None)
 
     def seek_to(t):
-        """Timeline click/drag: jump the selected camera's tile to time t."""
         ci = selected_cam; now = time.time()
         if t >= now - LIVE_EDGE_S:
             reviews.pop(ci, None); return
@@ -3749,7 +3312,7 @@ def run_monitor(cfg, person_model):
         try:
             os.makedirs("snapshots", exist_ok=True)
             fname = f"snapshots/{cameras[selected_cam]['name']}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-            ok, enc = cv2.imencode(".jpg", fr[selected_cam])   # imwrite can't do non-ASCII names
+            ok, enc = cv2.imencode(".jpg", fr[selected_cam])
             if ok:
                 with open(fname, "wb") as f: f.write(enc.tobytes())
             add_log(f"Snapshot saved: {fname}", THEME["accent"])
@@ -3801,7 +3364,6 @@ def run_monitor(cfg, person_model):
 
         gw=layout["grid_w"]; pw=layout["PW"]; ph=layout["PH"]
 
-        # hover - for the bar buttons' highlight + tooltip
         hov = None
         if y < TOP_BAR_H:
             hov = next((k for k,(rx1,ry1,rx2,ry2) in layout["icon_rects"].items()
@@ -3812,7 +3374,6 @@ def run_monitor(cfg, person_model):
                         if rx1<=x<=rx2 and ry1<=pby<=ry2), None)
         layout["hover"] = hov; layout["mouse"] = (x, y)
 
-        # timeline scrubbing: keeps following the mouse while the button is held
         if layout.get("scrub"):
             if event==cv2.EVENT_LBUTTONUP:
                 layout["scrub"]=False; return
@@ -3820,7 +3381,6 @@ def run_monitor(cfg, person_model):
                 t0,t1,tx1,tx2 = layout["timeline"]
                 seek_to(t0 + (t1-t0)*min(1.0,max(0.0,(x-tx1)/max(1,tx2-tx1)))); return
 
-        # 1) top bar icon clicks
         if y < TOP_BAR_H:
             if event==cv2.EVENT_LBUTTONDOWN:
                 for key,(rx1,ry1,rx2,ry2) in layout["icon_rects"].items():
@@ -3838,14 +3398,8 @@ def run_monitor(cfg, person_model):
                         return
             return
 
-        # 1b) review bar — rewind/pause/forward/stop, always acts on
-        # selected_cam regardless of where in the bar's width it's clicked
-        # (it spans the full window width like the top bar does)
         if y >= TOP_BAR_H + layout["grid_h"]:
             if event==cv2.EVENT_LBUTTONDOWN:
-                # playback_rects are local to the review bar's own canvas
-                # (y in [0, PLAYBACK_BAR_H)), same convention as panel_hits
-                # being local to the sidebar - offset the real y before testing
                 pby = y - (TOP_BAR_H + layout["grid_h"])
                 for key,(rx1,ry1,rx2,ry2) in layout["playback_rects"].items():
                     if rx1<=x<=rx2 and ry1<=pby<=ry2:
@@ -3860,10 +3414,6 @@ def run_monitor(cfg, person_model):
                         return
             return
 
-        # 2) fixed sidebar — empty and inert when no panel is chosen, else
-        # handles clicks in its own content; a click on the empty sidebar
-        # does nothing (there's nothing to click), it just doesn't fall
-        # through to the camera grid underneath it
         if x >= gw:
             if active_panel:
                 if event==cv2.EVENT_LBUTTONDOWN:
@@ -3917,7 +3467,7 @@ def run_monitor(cfg, person_model):
                                     add_log("ALL zones turned back ON", THEME["ok"]); log_file("ZONES_RESUMED")
                                 else:
                                     ZONES_PAUSE["off"]="manual" if value=="manual" else time.time()+value*3600
-                                    cam_tracked.clear(); cam_nid.clear()     # nobody stays "armed" mid-check
+                                    cam_tracked.clear(); cam_nid.clear()
                                     add_log(f"ALL zones OFF {zones_pause_text()}", THEME["warn"])
                                     log_file("ZONES_PAUSED", zones_pause_text())
                                 cfg["zones_paused"]=ZONES_PAUSE["off"]; save_config(cfg)
@@ -3970,7 +3520,7 @@ def run_monitor(cfg, person_model):
                     elif label=="Zoom Out":    zone_editor.resize_selected(active_menu_cam,0.9)
                     elif label=="Delete Zone":
                         zone_editor.delete_selected(active_menu_cam)
-                        editing_zone=None   # indexes shift after a delete
+                        editing_zone=None
                         add_log("Zone deleted",THEME["danger"])
                     elif label=="Exit Program": quit_requested=True
                     zone_editor.save_to(cfg); save_config(cfg)
@@ -3978,17 +3528,14 @@ def run_monitor(cfg, person_model):
             else:
                 zone_menu_visible=False; return
 
-        # 3) camera tiles - the grid, or one enlarged camera + the strip
         gy = y - TOP_BAR_H
         hit = next(((i, x-tx, gy-ty, tw, th) for i,(tx,ty,tw,th) in enumerate(layout["rects"])
                     if tx<=x<tx+tw and ty<=gy<ty+th), None)
         if hit is None: return
         ci,cx,cy,pw,ph = hit
         if focus_cam is not None and ci!=focus_cam and (drawing_zone or edit_mode):
-            return      # while enlarged, zones are drawn/edited on the big camera only
+            return
         if not drawing_zone and not edit_mode:
-            # OpenCV may deliver the 2nd click as DBLCLK or as a plain DOWN
-            # depending on the window class, so both are handled.
             if event==cv2.EVENT_LBUTTONDBLCLK or (event==cv2.EVENT_LBUTTONDOWN and last_click[1]==ci
                                                    and time.time()-last_click[0] < DOUBLE_CLICK_S):
                 toggle_focus(ci); last_click[:]=[0.0,None]; return
@@ -3997,8 +3544,6 @@ def run_monitor(cfg, person_model):
 
         if drawing_zone:
             if event==cv2.EVENT_LBUTTONDOWN:
-                # stored in the fixed virtual space, not current screen pixels,
-                # so the zone stays aligned however the window gets resized later
                 active_draw_cam=ci
                 new_zone_pts.append([int(cx*ZONE_BASE_W/pw), int(cy*ZONE_BASE_H/ph)])
             elif event==cv2.EVENT_RBUTTONDOWN:
@@ -4032,7 +3577,7 @@ def run_monitor(cfg, person_model):
         if quit_requested or back_requested: break
         now_ts=time.time()
         room_watch.tick()
-        if now_ts-last_zone_expiry[0] >= 1.0:       # "off for N hours" zones coming back on
+        if now_ts-last_zone_expiry[0] >= 1.0:
             last_zone_expiry[0]=now_ts
             back=zone_editor.expire_offs(now_ts)
             for zci,z in back:
@@ -4043,9 +3588,6 @@ def run_monitor(cfg, person_model):
                 ZONES_PAUSE["off"]=None; cfg["zones_paused"]=None; save_config(cfg)
                 add_log("ALL zones are back ON", THEME["ok"]); log_file("ZONES_RESUMED")
 
-        # Re-render everything at whatever size the OS window actually is
-        # right now, instead of stretching a fixed-size bitmap to fit — that
-        # stretch is what caused the blurry text/icons when enlarging.
         try:
             _,_,win_w,win_h = cv2.getWindowImageRect(WIN)
             if win_w>0 and win_h>0:
@@ -4055,13 +3597,9 @@ def run_monitor(cfg, person_model):
             pass
         layout["PW"]=PW; layout["PH"]=PH
 
-        # The zone editor only lives inside the Select panel; leaving the
-        # panel (or the zone disappearing) ends the edit session.
         if active_panel != "select" or editing_zone_obj() is None:
             editing_zone = None
 
-        # Tile layout for this frame: the normal grid, or - after a double-
-        # click - one camera large with the others in a strip underneath.
         if focus_cam is not None and (focus_cam >= n or n < 2): focus_cam = None
         f_aspect = 4/3
         if focus_cam is not None and last_frames[focus_cam] is not None:
@@ -4081,8 +3619,6 @@ def run_monitor(cfg, person_model):
             for ci,(cap,cam) in enumerate(zip(caps,cameras)):
                 tx,ty,tw,th = rects[ci]
                 compact = th < COMPACT_TILE_H
-                # The live picture is ALWAYS read, analysed and recorded -
-                # also while this camera's tile is showing recorded footage.
                 raw=None
                 if cap is None:
                     if now_ts-cam_last_reconnect[ci] > CAM_RECONNECT_COOLDOWN:
@@ -4095,11 +3631,11 @@ def run_monitor(cfg, person_model):
                 if cap is not None:
                     starting = getattr(cap,"starting",False)
                     ret,frame=cap.read()
-                    if not ret and not starting:     # video file: loop back to the start
+                    if not ret and not starting:
                         cap.set(cv2.CAP_PROP_POS_FRAMES,0); ret,frame=cap.read()
                     if ret:
                         cam_fail_count[ci]=0
-                        raw=frame; last_frames[ci]=frame   # never drawn on - safe to keep
+                        raw=frame; last_frames[ci]=frame
                     elif not starting:
                         cam_fail_count[ci]+=1
                         if (cam_fail_count[ci]>=CAM_RECONNECT_AFTER
@@ -4113,10 +3649,9 @@ def run_monitor(cfg, person_model):
                                 cam_fail_count[ci]=0
 
                 if raw is not None:
-                    # analysed at the fixed PROC size, shown at the tile size
                     proc=cv2.resize(raw,(PROC_W,PROC_H),interpolation=cv2.INTER_AREA)
                     room_watch.measure(ci,proc,now_ts)
-                    person_det.submit(ci,proc,now_ts,raw)       # analysed on the person thread
+                    person_det.submit(ci,proc,now_ts,raw)
                     det=person_det.get(ci)
                     cam_overlays[ci]=process_cam_frame(proc,ci,zone_editor,now_ts,det)
                     room_watch.update(ci,proc,len(det[0]) if det else 0,now_ts,cam["name"])
@@ -4132,14 +3667,14 @@ def run_monitor(cfg, person_model):
                     rv["tick"]=now_ts; rv["t"]=min(rv["t"],now_ts)
                     if rv.get("speed",1) < 0 and not rv["paused"]:
                         sp_ = readers[ci].spans()
-                        if sp_ and rv["t"] <= sp_[0][0]:      # rewound to the very start
+                        if sp_ and rv["t"] <= sp_[0][0]:
                             rv["t"]=sp_[0][0]; rv["paused"]=True; rv["speed"]=1
                     if not rv["paused"] and rv["t"]>=now_ts-LIVE_EDGE_S:
-                        reviews.pop(ci,None); rv=None        # caught up with live
+                        reviews.pop(ci,None); rv=None
 
                 if rv is not None:
                     _,rimg = readers[ci].frame_at(rv["t"])
-                    if rimg is None and not rv["paused"]:     # a gap (program was off): skip it
+                    if rimg is None and not rv["paused"]:
                         sp_ = readers[ci].spans()
                         if rv.get("speed",1) > 0:
                             nxt = next((a for a,b in sp_ if a > rv["t"]), None)
@@ -4179,7 +3714,7 @@ def run_monitor(cfg, person_model):
                             put_text(tile,msg_,(30,47),cv2.FONT_HERSHEY_SIMPLEX,0.38,THEME["black"],1)
 
                 editable = (focus_cam is None or ci == focus_cam) and rv is None
-                if rv is None:            # recorded footage already has its zones burned in
+                if rv is None:
                     zone_editor.draw_zones(tile,ci,edit_mode and editable,pw=tw,ph=th)
                     if editing_zone is not None and editing_zone[0]==ci:
                         ez_pts = zone_editor.scaled_points(editing_zone_obj(), tw, th)
@@ -4192,7 +3727,6 @@ def run_monitor(cfg, person_model):
                         if len(disp_pts)>1:
                             cv2.polylines(tile,[np.array(disp_pts,dtype=np.int32)],False,col,1)
 
-                # header: translucent strip with the camera name (+ REC dot)
                 hh = 22 if compact else 30
                 shade(tile,0,0,tw,hh,THEME["bg_header"],0.78)
                 draw_glyph_icon(tile,"video",13 if compact else 17,hh//2,13 if compact else 17,
@@ -4214,8 +3748,6 @@ def run_monitor(cfg, person_model):
                 if rv is not None:
                     draw_review_badge(tile, rv, now_ts, compact)
                 elif not compact:
-                    # timestamp burn-in, bottom-right corner — this machine's own
-                    # clock, same on every tile (matches real CCTV overlay style)
                     ts_text = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
                     (ts_w, ts_h), _ = text_size(ts_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
                     ts_x2, ts_y2 = tw-6, th-6
@@ -4235,9 +3767,6 @@ def run_monitor(cfg, person_model):
             print(f"[FRAME LOOP ERROR] {e}")
             add_log(f"Frame processing error: {e}", THEME["danger"])
 
-        # fixed docked sidebar — empty when idle, filled with the active
-        # panel's content otherwise; always PANEL_W wide, never eats into
-        # the camera grid's own width
         panel_hits=[]
         if active_panel=="log":
             panel_canvas,panel_hits = build_panel_log(PANEL_W, grid_h, logui)
@@ -4307,9 +3836,6 @@ def run_monitor(cfg, person_model):
             set_opencv_window_icon(WIN, ICON_PATH)
             _icon_applied = True
 
-        # Sleep only what's left of this frame's time slot - waiting the full
-        # frame_delay on top of the processing time is what capped the old
-        # loop at ~17 fps even with a 30 fps source.
         spent_ms=(time.time()-now_ts)*1000
         key=cv2.waitKey(max(1,int(frame_delay-spent_ms)))&0xFF
         if   key==ord('q'): quit_requested=True
@@ -4323,7 +3849,7 @@ def run_monitor(cfg, person_model):
         elif key==127:
             del_ci = zone_editor.selected_index if zone_editor.selected_index is not None else active_draw_cam
             zone_editor.delete_selected(del_ci)
-            editing_zone = None   # indexes shift after a delete
+            editing_zone = None
             zone_editor.save_to(cfg); save_config(cfg)
         elif key==ord('+'):
             rz_ci = zone_editor.selected_index if zone_editor.selected_index is not None else active_draw_cam
@@ -4357,13 +3883,8 @@ def run_monitor(cfg, person_model):
     cv2.destroyAllWindows()
     return back_requested
 
-# ── ENTRY ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if sys.platform == "win32":
-        # Without this, Windows treats the whole app as DPI-unaware and
-        # bitmap-stretches every window to match the display's scale factor
-        # (125%/150%/etc, the default on most laptops) — that's what actually
-        # causes the blurry/"pixelated" look, not the image resolution itself.
         try:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
